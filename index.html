@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Evaluación en línea</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,Arial,sans-serif;background:#eef1f6;color:#1f2937;user-select:none}
+.wrap{max-width:720px;margin:0 auto;padding:16px}
+.card{background:#fff;border-radius:12px;padding:24px;box-shadow:0 2px 10px rgba(0,0,0,.08);margin-top:16px}
+h1{font-size:1.3rem;margin:0 0 12px;color:#0b3d91}
+input{width:100%;padding:12px;margin:6px 0 14px;border:1px solid #cbd5e1;border-radius:8px;font-size:1rem;user-select:text}
+button{cursor:pointer;font-size:1rem;border:0;border-radius:8px}
+.primary{background:#0b3d91;color:#fff;padding:12px 24px}
+.primary:disabled{opacity:.4;cursor:not-allowed}
+.opt{display:block;width:100%;text-align:left;background:#f8fafc;border:2px solid #e2e8f0;padding:14px;margin:8px 0}
+.opt:hover{border-color:#94a3b8}.opt.sel{border-color:#0b3d91;background:#e0ebff}
+.bar{display:flex;justify-content:space-between;font-weight:600;margin-bottom:10px}
+#timer{color:#0b3d91}#timer.low{color:#dc2626}
+#warn{display:none;background:#fee2e2;border:1px solid #dc2626;color:#991b1b;padding:10px;border-radius:8px;margin-bottom:12px;font-weight:600}
+.msg{color:#b91c1c;font-weight:600;min-height:1.2em}
+.hide{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <!-- Acceso -->
+  <div id="s-login" class="card">
+    <h1 id="titulo">Cargando…</h1>
+    <label>Nombre completo</label><input id="nombre" autocomplete="off">
+    <label>Carnet</label><input id="carnet" autocomplete="off">
+    <p style="font-size:.9rem">Una vez iniciada, no podrá regresar a preguntas anteriores ni cambiar de pestaña. Cada cambio queda registrado.</p>
+    <div id="loginMsg" class="msg"></div>
+    <button id="btnStart" class="primary" disabled>Iniciar evaluación</button>
+  </div>
+  <!-- Examen -->
+  <div id="s-exam" class="card hide">
+    <div id="warn"></div>
+    <div class="bar"><span id="prog"></span><span id="timer"></span></div>
+    <h1 id="q" style="color:#1f2937"></h1>
+    <div id="opts"></div>
+    <div style="text-align:right;margin-top:14px"><button id="next" class="primary" disabled>Siguiente</button></div>
+  </div>
+  <!-- Mensajes finales -->
+  <div id="s-end" class="card hide"><h1 id="endT"></h1><p id="endP"></p><button id="retry" class="primary hide">Reintentar envío</button></div>
+</div>
+
+<script>
+/* ====== CONFIGURACIÓN: pegue aquí la URL de su Aplicación web de Apps Script ====== */
+const API = 'PEGA_AQUI_LA_URL_DEL_WEB_APP';
+
+const $ = id => document.getElementById(id);
+const TAB = Math.random().toString(36).slice(2), LK = 'eval_lock';
+let S = {}, idx = 0, resp = [], cambios = 0, finished = false, selected = null, lastV = 0;
+let qEnd = 0, qTimer = null, gTimer = null, offset = 0, payload = null;
+
+const show = id => ['s-login', 's-exam', 's-end'].forEach(s => $(s).classList.toggle('hide', s !== id));
+function endScreen(t, p, retry) { show('s-end'); $('endT').textContent = t; $('endP').textContent = p; $('retry').classList.toggle('hide', !retry); }
+
+/* ---------- Sesión única (localStorage) ---------- */
+function lockFree() {
+  try { const l = JSON.parse(localStorage.getItem(LK) || 'null'); return !l || l.tab === TAB || Date.now() - l.ts > 4000; }
+  catch (e) { return true; }
+}
+const beat = () => { try { localStorage.setItem(LK, JSON.stringify({ tab: TAB, ts: Date.now() })); } catch (e) {} };
+
+/* ---------- Bloqueo del botón Atrás ---------- */
+history.pushState(null, '', location.href);
+window.addEventListener('popstate', () => history.pushState(null, '', location.href));
+window.addEventListener('beforeunload', e => { if (S.token && !finished) { e.preventDefault(); e.returnValue = ''; } });
+['contextmenu', 'copy', 'cut', 'paste'].forEach(ev => document.addEventListener(ev, e => { if (S.token && !finished) e.preventDefault(); }));
+
+/* ---------- Inicio ---------- */
+(async function init() {
+  if (!lockFree()) return endScreen('Evaluación abierta en otra ventana', 'Cierre esta pestaña. Solo se permite una ventana a la vez.');
+  beat(); setInterval(beat, 1500);
+  try {
+    const c = await (await fetch(API + '?action=config')).json();
+    $('titulo').textContent = c.titulo || 'Evaluación en línea';
+    if (c.deadline && c.serverNow >= c.deadline) return endScreen('Evaluación cerrada', 'La hora límite ya fue alcanzada.');
+    $('btnStart').disabled = false;
+  } catch (e) { $('titulo').textContent = 'Evaluación en línea'; $('loginMsg').textContent = 'No se pudo conectar con el servidor. Recargue la página.'; }
+})();
+
+$('btnStart').onclick = async () => {
+  const nombre = $('nombre').value.trim(), carnet = $('carnet').value.trim();
+  if (!nombre || !carnet) return $('loginMsg').textContent = 'Ingrese su nombre y carnet.';
+  if (localStorage.getItem('eval_' + carnet.toLowerCase())) return $('loginMsg').textContent = 'Este carnet ya tiene un examen registrado o iniciado';
+  $('btnStart').disabled = true; $('loginMsg').textContent = 'Verificando…';
+  try {
+    const d = await (await fetch(API + '?action=start&nombre=' + encodeURIComponent(nombre) + '&carnet=' + encodeURIComponent(carnet))).json();
+    if (!d.ok) { $('loginMsg').textContent = d.msg; $('btnStart').disabled = false; return; }
+    try { localStorage.setItem('eval_' + carnet.toLowerCase(), '1'); } catch (e) {}
+    S = d; S.carnet = carnet; offset = d.serverNow - Date.now(); idx = 0; resp = [];
+    gTimer = setInterval(() => { if (S.deadline && Date.now() + offset >= S.deadline) finish('TIEMPO_GLOBAL'); }, 1000);
+    show('s-exam'); render();
+  } catch (e) { $('loginMsg').textContent = 'Error de conexión. Intente de nuevo.'; $('btnStart').disabled = false; }
+};
+
+/* ---------- Preguntas ---------- */
+function render() {
+  const p = S.preguntas[idx]; selected = null;
+  $('prog').textContent = 'Pregunta ' + (idx + 1) + ' de ' + S.preguntas.length;
+  $('q').textContent = p.q;
+  $('opts').innerHTML = '';
+  p.o.forEach((o, i) => {
+    const b = document.createElement('button');
+    b.className = 'opt'; b.textContent = 'ABCD'[i] + ') ' + o.t;
+    b.onclick = () => { selected = o.k; [...$('opts').children].forEach(x => x.classList.remove('sel')); b.classList.add('sel'); $('next').disabled = false; };
+    $('opts').appendChild(b);
+  });
+  $('next').disabled = true;
+  $('next').textContent = idx === S.preguntas.length - 1 ? 'Finalizar' : 'Siguiente';
+  qEnd = Date.now() + S.tiempo * 1000;           // reinicia el temporizador por pregunta
+  clearInterval(qTimer); tick(); qTimer = setInterval(tick, 250);
+}
+function tick() {
+  const left = Math.max(0, Math.ceil((qEnd - Date.now()) / 1000));
+  $('timer').textContent = '⏱ ' + Math.floor(left / 60) + ':' + ('0' + left % 60).slice(-2);
+  $('timer').classList.toggle('low', left <= 15);
+  if (left <= 0 && !finished) { clearInterval(qTimer); resp.push({ id: S.preguntas[idx].id, r: null, t: 1 }); advance(); }
+}
+$('next').onclick = () => { if (!selected) return; clearInterval(qTimer); resp.push({ id: S.preguntas[idx].id, r: selected, t: 0 }); advance(); };
+function advance() { idx++; idx >= S.preguntas.length ? finish('COMPLETO') : render(); }
+
+/* ---------- Anti-fraude ---------- */
+function violation() {
+  if (!S.token || finished) return;
+  const n = Date.now(); if (n - lastV < 1000) return; lastV = n;   // evita contar blur + visibilitychange dos veces
+  cambios++;
+  $('warn').style.display = 'block';
+  $('warn').textContent = '⚠ Salió de la evaluación: ' + cambios + ' de ' + S.maxCambios + ' cambios permitidos. Al alcanzar el límite su examen será anulado.';
+  if (cambios >= S.maxCambios) finish('FRAUDE');
+}
+document.addEventListener('visibilitychange', () => { if (document.hidden) violation(); });
+window.addEventListener('blur', violation);
+
+/* ---------- Envío ---------- */
+function finish(motivo) {
+  if (finished) return; finished = true;
+  clearInterval(qTimer); clearInterval(gTimer);
+  // Incluye la opción marcada en la pregunta actual si aún no se confirmó
+  if (resp.length < S.preguntas.length && selected && !resp.find(r => r.id === S.preguntas[idx].id))
+    resp.push({ id: S.preguntas[idx].id, r: selected, t: 0 });
+  payload = { carnet: S.carnet, token: S.token, motivo: motivo, cambios: cambios, respuestas: resp };
+  enviar(motivo);
+}
+async function enviar(motivo) {
+  endScreen('Enviando…', 'Por favor no cierre esta ventana.');
+  for (let i = 0; i < 4; i++) {
+    try {
+      const r = await fetch(API, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload) });
+      const j = await r.json();
+      if (j.ok) {
+        let extra = '';
+        if (motivo === 'FRAUDE') extra = ' La evaluación se cerró por exceder los cambios de ventana permitidos.';
+        if (motivo === 'TIEMPO_GLOBAL') extra = ' La evaluación se cerró por alcanzar la hora límite.';
+        return endScreen('Evaluación finalizada', 'Sus respuestas fueron procesadas correctamente.' + extra);
+      }
+      if (j.msg) return endScreen('No se pudo registrar', j.msg);
+    } catch (e) {}
+    await new Promise(r => setTimeout(r, 2000 * (i + 1)));
+  }
+  endScreen('Error de conexión', 'No se pudo enviar. Verifique su internet y presione reintentar; no cierre esta ventana.', true);
+}
+$('retry').onclick = () => enviar(payload.motivo);
+</script>
+</body>
+</html>
